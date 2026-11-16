@@ -147,6 +147,8 @@ pub struct View<'a> {
     pub hover: Option<Btn>,
     pub pressed: Option<Btn>,
     pub font: Option<&'a Font>,
+    /// Bottom edge of the screen, to flip tooltips above the bar when needed.
+    pub screen_bottom: i32,
 }
 
 pub struct Toolbar {
@@ -194,10 +196,10 @@ impl Toolbar {
         IRect::xywh(self.x, self.y, self.w, self.h)
     }
 
-    /// Area including space reserved for a tooltip below the bar.
+    /// Area including antialiasing margin and space for a tooltip above or below the bar.
     pub fn rect_with_tooltip(&self) -> IRect {
         let r = self.rect();
-        IRect::new(r.x0 - 200, r.y0, r.x1 + 200, r.y1 + 44)
+        IRect::new(r.x0 - 200, r.y0 - 48, r.x1 + 200, r.y1 + 48)
     }
 
     pub fn btn_at(&self, x: f32, y: f32) -> Option<Btn> {
@@ -278,7 +280,8 @@ impl Toolbar {
             let probe = font.text_path(&text, 0.0, 0.0, px);
             let (tw, th) = (probe.width + 16.0, probe.height + 8.0);
             let tx = ((r.x0 + r.x1) as f32 / 2.0 - tw / 2.0).max((bar.x0 - 190) as f32);
-            let ty = (bar.y1 + 6) as f32;
+            let below = (bar.y1 + 6) as f32;
+            let ty = if below + th > v.screen_bottom as f32 { bar.y0 as f32 - 6.0 - th } else { below };
             if let Some(p) = rounded(IRect::from_f(tx, ty, tx + tw, ty + th, 0.0), 6.0) {
                 pm.fill_path(&p, &paint(Rgba(15, 15, 20, 240)), FillRule::Winding, tf, None);
             }

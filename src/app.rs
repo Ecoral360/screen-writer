@@ -113,6 +113,7 @@ pub struct App {
     board: u8,
 
     toolbar: Toolbar,
+    monitors: Vec<IRect>,
     hover: Option<Btn>,
     drag: Drag,
     current: Option<Shape>,
@@ -133,6 +134,7 @@ impl App {
         let base = Pixmap::new(x.width as u32, x.height as u32).expect("screen has zero size");
         let mut toolbar = Toolbar::new();
         toolbar.place(x.primary_monitor());
+        let monitors = x.monitors();
         let mut app = App {
             x,
             font: Font::load(),
@@ -147,6 +149,7 @@ impl App {
             size: 4.0,
             fill: false,
             board: 0,
+            monitors,
             toolbar,
             hover: None,
             drag: Drag::None,
@@ -432,6 +435,7 @@ impl App {
                     }
                     self.rebuild_base();
                     self.toolbar.place(self.x.primary_monitor());
+                    self.monitors = self.x.monitors();
                     let _ = self.x.set_input(self.active);
                     self.damage_all();
                 }
@@ -773,6 +777,13 @@ impl App {
         IRect::from_f(te.pos.x, te.pos.y, te.pos.x + tp.width + te.px, te.pos.y + tp.height, 10.0)
     }
 
+    /// Bottom edge of the monitor the toolbar is on.
+    fn toolbar_monitor_bottom(&self) -> i32 {
+        let t = self.toolbar.rect();
+        let (cx, cy) = ((t.x0 + t.x1) as f32 / 2.0, (t.y0 + t.y1) as f32 / 2.0);
+        self.monitors.iter().find(|m| m.contains(cx, cy)).map_or(self.x.height as i32, |m| m.y1)
+    }
+
     fn spotlight_on(&self) -> bool {
         self.active && self.visible && self.tool == Tool::Spotlight && self.cursor.is_some()
     }
@@ -892,6 +903,7 @@ impl App {
                         hover: self.hover,
                         pressed: None,
                         font: self.font.as_ref(),
+                        screen_bottom: self.toolbar_monitor_bottom(),
                     };
                     if self.toolbar.rect_with_tooltip().touches(&r, 0) {
                         self.toolbar.draw(&mut m, tf, &view);

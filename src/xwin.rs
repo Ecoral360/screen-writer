@@ -9,7 +9,7 @@ use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
-use x11rb::{CURRENT_TIME, NONE};
+use x11rb::CURRENT_TIME;
 
 pub mod keysym {
     pub const F9: u32 = 0xffc6;
@@ -108,6 +108,8 @@ pub struct XWin {
     msb_first: bool,
     mapped: bool,
     hotkey_code: Option<u8>,
+    /// Keyboard focus before we took it, restored when drawing stops.
+    prev_focus: std::cell::Cell<Option<(Window, InputFocus)>>,
 }
 
 impl XWin {
@@ -185,7 +187,7 @@ impl XWin {
         let keymap = Keymap::load(&conn)?;
         let msb_first = conn.setup().image_byte_order == ImageOrder::MSB_FIRST;
 
-        let mut x = XWin { conn, root, win, gc, width, height, keymap, msb_first, mapped: false, hotkey_code: None };
+        let mut x = XWin { conn, root, win, gc, width, height, keymap, msb_first, mapped: false, hotkey_code: None, prev_focus: Default::default() };
         x.set_input(false)?;
         x.grab_hotkeys();
         x.set_mapped(true)?;
@@ -247,6 +249,12 @@ impl XWin {
 
     /// Try to obtain keyboard input (works on X11; best effort under XWayland).
     pub fn grab_keyboard(&self, time: u32) {
+        if self.prev_focus.get().is_none()
+            && let Ok(Ok(f)) = self.conn.get_input_focus().map(|c| c.reply())
+            && f.focus != self.win
+        {
+            self.prev_focus.set(Some((f.focus, f.revert_to)));
+        }
         let _ = self.conn.set_input_focus(InputFocus::PARENT, self.win, time);
         if let Ok(c) = self.conn.grab_keyboard(true, self.win, time, GrabMode::ASYNC, GrabMode::ASYNC) {
             // Don't block on the reply; we don't need to know.
@@ -254,9 +262,15 @@ impl XWin {
         }
     }
 
+    /// Release the keyboard and give focus back to whoever had it before
+    /// (never to "None", which leaves the desktop without keyboard focus).
     pub fn ungrab_keyboard(&self) {
         let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
-        let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, NONE, CURRENT_TIME);
+        let (focus, revert) = self.prev_focus.take().unwrap_or((u32::from(InputFocus::POINTER_ROOT), InputFocus::POINTER_ROOT));
+        // Focus may name a window that has since been destroyed; fall back to PointerRoot.
+        let ok = focus <= 1 || self.conn.get_window_attributes(focus).map(|c| c.reply().is_ok()).unwrap_or(false);
+        let target = if ok && focus != u32::from(InputFocus::NONE) { focus } else { u32::from(InputFocus::POINTER_ROOT) };
+        let _ = self.conn.set_input_focus(revert, target, CURRENT_TIME);
     }
 
     pub fn resize(&mut self, w: u16, h: u16) -> Result<()> {
@@ -264,6 +278,15 @@ impl XWin {
         self.height = h;
         self.conn.configure_window(self.win, &ConfigureWindowAux::new().x(0).y(0).width(w as u32).height(h as u32))?;
         Ok(())
+    }
+
+    /// Geometry of all active monitors (falls back to the whole screen).
+    pub fn monitors(&self) -> Vec<IRect> {
+        let full = IRect::xywh(0, 0, self.width as i32, self.height as i32);
+        let Ok(Ok(r)) = self.conn.randr_get_monitors(self.root, true).map(|c| c.reply()) else { return vec![full] };
+        let v: Vec<IRect> =
+            r.monitors.iter().map(|m| IRect::xywh(m.x as i32, m.y as i32, m.width as i32, m.height as i32)).collect();
+        if v.is_empty() { vec![full] } else { v }
     }
 
     /// Geometry of the primary monitor (falls back to the whole screen).
