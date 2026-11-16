@@ -122,9 +122,13 @@ On Wayland, screen-writer runs through XWayland. GNOME doesn't support the
 
 ## Known limitations
 
-- **Keyboard on Wayland:** the compositor may not send keyboard input to the
-  overlay. If that happens, letter shortcuts and the text tool won't work. The
-  toolbar, mouse controls and global hotkeys still work.
+- **Keyboard focus while drawing:** an always-on-top overlay window can't receive
+  keyboard focus on Wayland. So while you're drawing, screen-writer also opens a
+  tiny invisible window named "screen-writer (drawing)", and GNOME gives it focus
+  like any other app. It may show up in the Activities overview. Alt+F4 on it
+  stops drawing. When drawing stops, the window closes and focus goes back to the
+  app you were using. If you switch apps mid-drawing, clicking the overlay brings
+  keyboard focus back.
 - **No pressure sensitivity:** tablet pressure isn't used yet.
 - **HiDPI:** with fractional scaling, XWayland windows may look blurry.
 

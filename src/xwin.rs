@@ -9,7 +9,6 @@ use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
-use x11rb::CURRENT_TIME;
 
 pub mod keysym {
     pub const F9: u32 = 0xffc6;
@@ -108,10 +107,14 @@ pub struct XWin {
     msb_first: bool,
     mapped: bool,
     hotkey_code: Option<u8>,
-    /// Keyboard focus before we took it, restored when drawing stops.
-    prev_focus: std::cell::Cell<Option<(Window, InputFocus)>>,
-    /// Running under XWayland (keyboard focus is owned by the Wayland compositor).
-    wayland: bool,
+    /// Tiny invisible *managed* window mapped while drawing. The window manager
+    /// gives it keyboard focus like any app window (override-redirect windows
+    /// such as `win` never get focus on Wayland), and refocuses the previous app
+    /// when it is unmapped.
+    pub kbd: Window,
+    kbd_mapped: bool,
+    net_active_window: Atom,
+    pub wm_delete_window: Atom,
 }
 
 impl XWin {
@@ -189,9 +192,54 @@ impl XWin {
         let keymap = Keymap::load(&conn)?;
         let msb_first = conn.setup().image_byte_order == ImageOrder::MSB_FIRST;
 
-        let mut x = XWin { conn, root, win, gc, width, height, keymap, msb_first, mapped: false, hotkey_code: None, prev_focus: Default::default(),
-            wayland: std::env::var_os("WAYLAND_DISPLAY").is_some()
-                || std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t == "wayland"),
+        let kbd = conn.generate_id()?;
+        conn.create_window(
+            32,
+            kbd,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            visual,
+            &CreateWindowAux::new()
+                .background_pixel(0)
+                .border_pixel(0)
+                .colormap(colormap)
+                .event_mask(EventMask::KEY_PRESS | EventMask::FOCUS_CHANGE),
+        )?;
+        let atom = |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
+        let (wm_protocols, wm_delete_window) = (atom(b"WM_PROTOCOLS")?, atom(b"WM_DELETE_WINDOW")?);
+        let net_active_window = atom(b"_NET_ACTIVE_WINDOW")?;
+        conn.change_property8(PropMode::REPLACE, kbd, AtomEnum::WM_NAME, AtomEnum::STRING, b"screen-writer (drawing)")?;
+        conn.change_property8(PropMode::REPLACE, kbd, AtomEnum::WM_CLASS, AtomEnum::STRING, b"screen-writer\0screen-writer\0")?;
+        conn.change_property32(PropMode::REPLACE, kbd, wm_protocols, AtomEnum::ATOM, &[wm_delete_window])?;
+        // WM_HINTS: flags = InputHint, input = True.
+        conn.change_property32(PropMode::REPLACE, kbd, AtomEnum::WM_HINTS, AtomEnum::WM_HINTS, &[1, 1, 0, 0, 0, 0, 0, 0, 0])?;
+        // No title bar or border.
+        let motif = atom(b"_MOTIF_WM_HINTS")?;
+        conn.change_property32(PropMode::REPLACE, kbd, motif, motif, &[2, 0, 0, 0, 0])?;
+        let (wm_state, skip_taskbar, skip_pager) =
+            (atom(b"_NET_WM_STATE")?, atom(b"_NET_WM_STATE_SKIP_TASKBAR")?, atom(b"_NET_WM_STATE_SKIP_PAGER")?);
+        conn.change_property32(PropMode::REPLACE, kbd, wm_state, AtomEnum::ATOM, &[skip_taskbar, skip_pager])?;
+
+        let mut x = XWin {
+            conn,
+            root,
+            win,
+            gc,
+            width,
+            height,
+            keymap,
+            msb_first,
+            mapped: false,
+            hotkey_code: None,
+            kbd,
+            kbd_mapped: false,
+            net_active_window,
+            wm_delete_window,
         };
         x.set_input(false)?;
         x.grab_hotkeys();
@@ -252,49 +300,31 @@ impl XWin {
         Ok(())
     }
 
-    /// Is `w` a normal, visible application window (not a hidden helper window)?
-    fn is_app_window(&self, w: Window) -> bool {
-        w > 1
-            && matches!(
-                self.conn.get_window_attributes(w).map(|c| c.reply()),
-                Ok(Ok(a)) if !a.override_redirect && a.map_state == MapState::VIEWABLE
-            )
-    }
-
-    /// Try to obtain keyboard input.
-    ///
-    /// Under XWayland the X server only receives keys while an X11 app has the
-    /// compositor's keyboard focus. When a Wayland app or nothing is focused, X
-    /// focus sits on the compositor's hidden placeholder window; moving it from
-    /// there gains nothing and confuses the compositor's focus tracking, so we
-    /// leave focus alone in that case.
-    pub fn grab_keyboard(&self, time: u32) {
-        let Ok(Ok(f)) = self.conn.get_input_focus().map(|c| c.reply()) else { return };
-        if f.focus != self.win {
-            if self.wayland && !self.is_app_window(f.focus) {
-                return;
-            }
-            if self.prev_focus.get().is_none() {
-                self.prev_focus.set(Some((f.focus, f.revert_to)));
-            }
+    /// Map the keyboard window; the window manager focuses it like a new app window.
+    pub fn take_keyboard(&mut self) {
+        if !self.kbd_mapped {
+            let _ = self.conn.map_window(self.kbd);
+            self.kbd_mapped = true;
         }
-        let _ = self.conn.set_input_focus(InputFocus::PARENT, self.win, time);
-        // Fire and forget: dropping the cookie discards the reply.
-        let _ = self.conn.grab_keyboard(true, self.win, time, GrabMode::ASYNC, GrabMode::ASYNC);
     }
 
-    /// Release the keyboard and, if we took focus, give it back to whoever had
-    /// it (never to "None", which leaves the desktop without keyboard focus).
-    pub fn ungrab_keyboard(&self) {
-        let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
-        let Some((focus, revert)) = self.prev_focus.take() else { return };
-        // Someone else already moved focus away from us: don't fight them.
-        if !matches!(self.conn.get_input_focus().map(|c| c.reply()), Ok(Ok(f)) if f.focus == self.win) {
+    /// Ask the window manager (EWMH) to focus the keyboard window again, e.g.
+    /// after the user switched apps mid-drawing. `time` must come from a user event.
+    pub fn refocus_keyboard(&self, time: u32) {
+        if !self.kbd_mapped {
             return;
         }
-        let alive = self.conn.get_window_attributes(focus).map(|c| c.reply().is_ok()).unwrap_or(false);
-        let target = if alive { focus } else { u32::from(InputFocus::POINTER_ROOT) };
-        let _ = self.conn.set_input_focus(revert, target, CURRENT_TIME);
+        let ev = ClientMessageEvent::new(32, self.kbd, self.net_active_window, [1, time, 0, 0, 0]);
+        let mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY;
+        let _ = self.conn.send_event(false, self.root, mask, ev);
+    }
+
+    /// Unmap the keyboard window; the window manager refocuses the previous app.
+    pub fn release_keyboard(&mut self) {
+        if self.kbd_mapped {
+            let _ = self.conn.unmap_window(self.kbd);
+            self.kbd_mapped = false;
+        }
     }
 
     pub fn resize(&mut self, w: u16, h: u16) -> Result<()> {

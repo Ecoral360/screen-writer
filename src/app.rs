@@ -9,7 +9,6 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use tiny_skia::{FillRule, PathBuilder, Pixmap, PixmapMut, Rect, Transform};
-use x11rb::CURRENT_TIME;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::KeyButMask;
 
@@ -126,6 +125,7 @@ pub struct App {
     damage: Damage,
     last_transient: Vec<IRect>,
     last_spot: bool,
+    kbd_focused: bool,
     quit: bool,
 }
 
@@ -162,6 +162,7 @@ impl App {
             damage: Damage::default(),
             last_transient: Vec::new(),
             last_spot: false,
+            kbd_focused: false,
             quit: false,
         };
         app.damage_all();
@@ -292,7 +293,7 @@ impl App {
         self.active = true;
         let _ = self.x.set_input(true);
         let _ = self.x.raise();
-        self.x.grab_keyboard(CURRENT_TIME);
+        self.x.take_keyboard();
         self.damage_toolbar();
     }
 
@@ -306,7 +307,7 @@ impl App {
         self.active = false;
         self.hover = None;
         let _ = self.x.set_input(false);
-        self.x.ungrab_keyboard();
+        self.x.release_keyboard();
         self.damage_toolbar();
     }
 
@@ -461,7 +462,9 @@ impl App {
                 }
             }
             Event::ButtonPress(ev) if self.active => {
-                self.x.grab_keyboard(ev.time);
+                if !self.kbd_focused {
+                    self.x.refocus_keyboard(ev.time);
+                }
                 let p = Pt::new(ev.event_x as f32, ev.event_y as f32);
                 self.cursor = Some(p);
                 self.press(ev.detail, p, u16::from(ev.state));
@@ -480,6 +483,12 @@ impl App {
                 if self.hover.take().is_some() {
                     self.damage_toolbar();
                 }
+            }
+            Event::FocusIn(ev) if ev.event == self.x.kbd => self.kbd_focused = true,
+            Event::FocusOut(ev) if ev.event == self.x.kbd => self.kbd_focused = false,
+            // Closing the keyboard window (e.g. Alt+F4) stops drawing.
+            Event::ClientMessage(ev) if ev.window == self.x.kbd && ev.data.as_data32()[0] == self.x.wm_delete_window => {
+                self.deactivate()
             }
             Event::Error(err) => eprintln!("screen-writer: X error: {err:?}"),
             _ => {}
