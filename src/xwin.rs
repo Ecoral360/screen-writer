@@ -110,6 +110,8 @@ pub struct XWin {
     hotkey_code: Option<u8>,
     /// Keyboard focus before we took it, restored when drawing stops.
     prev_focus: std::cell::Cell<Option<(Window, InputFocus)>>,
+    /// Running under XWayland (keyboard focus is owned by the Wayland compositor).
+    wayland: bool,
 }
 
 impl XWin {
@@ -187,7 +189,10 @@ impl XWin {
         let keymap = Keymap::load(&conn)?;
         let msb_first = conn.setup().image_byte_order == ImageOrder::MSB_FIRST;
 
-        let mut x = XWin { conn, root, win, gc, width, height, keymap, msb_first, mapped: false, hotkey_code: None, prev_focus: Default::default() };
+        let mut x = XWin { conn, root, win, gc, width, height, keymap, msb_first, mapped: false, hotkey_code: None, prev_focus: Default::default(),
+            wayland: std::env::var_os("WAYLAND_DISPLAY").is_some()
+                || std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t == "wayland"),
+        };
         x.set_input(false)?;
         x.grab_hotkeys();
         x.set_mapped(true)?;
@@ -247,29 +252,48 @@ impl XWin {
         Ok(())
     }
 
-    /// Try to obtain keyboard input (works on X11; best effort under XWayland).
-    pub fn grab_keyboard(&self, time: u32) {
-        if self.prev_focus.get().is_none()
-            && let Ok(Ok(f)) = self.conn.get_input_focus().map(|c| c.reply())
-            && f.focus != self.win
-        {
-            self.prev_focus.set(Some((f.focus, f.revert_to)));
-        }
-        let _ = self.conn.set_input_focus(InputFocus::PARENT, self.win, time);
-        if let Ok(c) = self.conn.grab_keyboard(true, self.win, time, GrabMode::ASYNC, GrabMode::ASYNC) {
-            // Don't block on the reply; we don't need to know.
-            drop(c);
-        }
+    /// Is `w` a normal, visible application window (not a hidden helper window)?
+    fn is_app_window(&self, w: Window) -> bool {
+        w > 1
+            && matches!(
+                self.conn.get_window_attributes(w).map(|c| c.reply()),
+                Ok(Ok(a)) if !a.override_redirect && a.map_state == MapState::VIEWABLE
+            )
     }
 
-    /// Release the keyboard and give focus back to whoever had it before
-    /// (never to "None", which leaves the desktop without keyboard focus).
+    /// Try to obtain keyboard input.
+    ///
+    /// Under XWayland the X server only receives keys while an X11 app has the
+    /// compositor's keyboard focus. When a Wayland app or nothing is focused, X
+    /// focus sits on the compositor's hidden placeholder window; moving it from
+    /// there gains nothing and confuses the compositor's focus tracking, so we
+    /// leave focus alone in that case.
+    pub fn grab_keyboard(&self, time: u32) {
+        let Ok(Ok(f)) = self.conn.get_input_focus().map(|c| c.reply()) else { return };
+        if f.focus != self.win {
+            if self.wayland && !self.is_app_window(f.focus) {
+                return;
+            }
+            if self.prev_focus.get().is_none() {
+                self.prev_focus.set(Some((f.focus, f.revert_to)));
+            }
+        }
+        let _ = self.conn.set_input_focus(InputFocus::PARENT, self.win, time);
+        // Fire and forget: dropping the cookie discards the reply.
+        let _ = self.conn.grab_keyboard(true, self.win, time, GrabMode::ASYNC, GrabMode::ASYNC);
+    }
+
+    /// Release the keyboard and, if we took focus, give it back to whoever had
+    /// it (never to "None", which leaves the desktop without keyboard focus).
     pub fn ungrab_keyboard(&self) {
         let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
-        let (focus, revert) = self.prev_focus.take().unwrap_or((u32::from(InputFocus::POINTER_ROOT), InputFocus::POINTER_ROOT));
-        // Focus may name a window that has since been destroyed; fall back to PointerRoot.
-        let ok = focus <= 1 || self.conn.get_window_attributes(focus).map(|c| c.reply().is_ok()).unwrap_or(false);
-        let target = if ok && focus != u32::from(InputFocus::NONE) { focus } else { u32::from(InputFocus::POINTER_ROOT) };
+        let Some((focus, revert)) = self.prev_focus.take() else { return };
+        // Someone else already moved focus away from us: don't fight them.
+        if !matches!(self.conn.get_input_focus().map(|c| c.reply()), Ok(Ok(f)) if f.focus == self.win) {
+            return;
+        }
+        let alive = self.conn.get_window_attributes(focus).map(|c| c.reply().is_ok()).unwrap_or(false);
+        let target = if alive { focus } else { u32::from(InputFocus::POINTER_ROOT) };
         let _ = self.conn.set_input_focus(revert, target, CURRENT_TIME);
     }
 
