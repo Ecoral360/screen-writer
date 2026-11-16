@@ -41,6 +41,26 @@ cargo install --path .
 screen-writer install-gnome-shortcuts   # GNOME only, see below
 ```
 
+### Nix
+
+```sh
+nix run .                 # run without installing
+nix build .               # result/bin/screen-writer
+nix develop               # shell with cargo, clippy, rust-analyzer
+```
+
+To install it system-wide from your NixOS flake:
+
+```nix
+# inputs
+screen-writer.url = "github:<you>/screen-writer";   # or "path:/path/to/screen-writer"
+
+# configuration
+environment.systemPackages = [ inputs.screen-writer.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+```
+
+The package adds `fc-match` and `gsettings` to the program's `PATH`.
+
 Requirements:
 
 - X11, or Wayland with XWayland
