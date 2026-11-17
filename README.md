@@ -19,7 +19,7 @@ share, or sketch over anything. Inspired by
 | Rectangle | `R` | `Shift` makes a square, `F` toggles fill |
 | Ellipse | `O` | `Shift` makes a circle, `F` toggles fill |
 | Text | `T` | Click, type, then `Esc` or `Ctrl+Enter` to finish |
-| Numbered marker | `N` | Click to drop 1, 2, 3… (restarts at 1 after clear) |
+| Numbered marker | `N` | Click to drop 1, 2, 3… `Ctrl+R` restarts at 1 (so does clear) |
 | Eraser | `E` | Removes whole objects. Right-drag erases with any tool |
 | Laser pointer | `K` | Fading trail, nothing is saved |
 | Spotlight | `S` | Darkens the screen except around the cursor |

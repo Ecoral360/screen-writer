@@ -115,6 +115,7 @@ impl Btn {
     pub fn tooltip(self) -> String {
         match self {
             Btn::Grip => "Drag to move toolbar  (Space or Tab hides it)".into(),
+            Btn::Tool(Tool::Marker) => format!("{}  (N, Ctrl+R restarts at 1)", Tool::Marker.name()),
             Btn::Tool(t) => format!("{}  ({})", t.name(), t.key()),
             Btn::Fill => "Fill shapes  (F)".into(),
             Btn::Color(i) => format!("{}  ({})", COLOR_NAMES[i], i + 1),
@@ -208,6 +209,12 @@ impl Toolbar {
         }
         let (rx, ry) = (x - self.x as f32, y - self.y as f32);
         Some(self.items.iter().find(|(_, r)| r.contains(rx, ry)).map(|(b, _)| *b).unwrap_or(Btn::Grip))
+    }
+
+    /// Button exactly under the cursor; gaps between buttons give `None` (no tooltip).
+    pub fn item_at(&self, x: f32, y: f32) -> Option<Btn> {
+        let (rx, ry) = (x - self.x as f32, y - self.y as f32);
+        self.items.iter().find(|(_, r)| r.contains(rx, ry)).map(|(b, _)| *b)
     }
 
     fn btn_rect(&self, b: Btn) -> Option<IRect> {

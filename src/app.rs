@@ -498,6 +498,7 @@ impl App {
     fn key(&mut self, sym: u32, state: u16) {
         let ctrl = state & u16::from(KeyButMask::CONTROL) != 0;
         let shift = state & u16::from(KeyButMask::SHIFT) != 0;
+        let sup = state & u16::from(KeyButMask::MOD4) != 0;
 
         if let Some(te) = &self.text {
             let before = self.text_box(te);
@@ -528,6 +529,11 @@ impl App {
         }
 
         let ch = keysym_char(sym).map(|c| c.to_ascii_lowercase());
+        // Ctrl+R (or Super+R, the Cmd key) restarts numbered markers at 1.
+        if (ctrl || sup) && ch == Some('r') && self.tool == Tool::Marker {
+            self.marker_n = 1;
+            return;
+        }
         if ctrl {
             match ch {
                 Some('z') if shift => self.redo(),
@@ -687,7 +693,11 @@ impl App {
     fn motion(&mut self, p: Pt, state: u16) {
         let shift = state & u16::from(KeyButMask::SHIFT) != 0;
         // Toolbar hover / tooltip.
-        let hover = if matches!(self.drag, Drag::None) { self.on_toolbar(p) } else { None };
+        let hover = if matches!(self.drag, Drag::None) && self.toolbar.visible {
+            self.toolbar.item_at(p.x, p.y)
+        } else {
+            None
+        };
         if hover != self.hover {
             self.hover = hover;
             self.damage_toolbar();

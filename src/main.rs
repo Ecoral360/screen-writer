@@ -41,6 +41,7 @@ WHILE DRAWING:
     1-8 colors   F fill   [ ] size   W/B white/blackboard   C clear
     Ctrl+Z undo   Ctrl+Y redo   Space/Tab hide toolbar   Esc stop drawing
     Text tool: click, type, Enter = newline, Esc/Ctrl+Enter = finish
+    Marker tool: Ctrl+R restarts numbering at 1
 ";
 
 fn main() {
