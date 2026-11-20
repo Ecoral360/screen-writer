@@ -12,6 +12,7 @@ share, or sketch over anything. Inspired by
 
 | Tool | Key | Notes |
 |---|---|---|
+| Select and move | `V` | Drag anything you placed (strokes, arrows, text, markers, snapshots) to move it |
 | Pen | `P` | Smoothed freehand strokes |
 | Highlighter | `H` | Wide, translucent |
 | Line | `L` | `Shift` snaps to 15° |
@@ -23,6 +24,7 @@ share, or sketch over anything. Inspired by
 | Eraser | `E` | Removes whole objects. Right-drag erases with any tool |
 | Laser pointer | `K` | Fading trail, nothing is saved |
 | Spotlight | `S` | Darkens the screen except around the cursor |
+| Snapshot | `G` | Drag a region to capture it, then click to pin the copy anywhere. Drag a pinned snapshot to move it (or use Select) |
 
 You also get:
 
@@ -65,6 +67,8 @@ Requirements:
 
 - X11, or Wayland with XWayland
 - a running compositor (for transparency)
+- `xdg-desktop-portal` (with the GNOME or another backend), used by the snapshot
+  tool to capture the screen
 - `fc-match` (fontconfig), used to find a font for the text tools. To pick a
   font yourself, set `SCREEN_WRITER_FONT=/path/to/font.ttf`.
 
@@ -104,8 +108,9 @@ On other desktops, bind the keys to the commands above yourself.
 | `C` or `Delete` | Clear |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Y` or `Ctrl+Shift+Z` | Redo |
-| `Space` / `Tab` | Hide/show the toolbar |
-| `Esc` | Stop drawing (drawings stay on screen) |
+| `Space` | Hide/show the toolbar |
+| `Tab` | Hide/show the toolbar *and* the cursor preview (marker ghost, size ring, select outline), for a clean screen in screenshots and shares. The laser dot stays |
+| `Esc` | Stop drawing (drawings stay on screen). While placing a new snapshot, discards it instead |
 
 ## Command line
 
@@ -113,7 +118,7 @@ On other desktops, bind the keys to the commands above yourself.
 screen-writer                  start the daemon (idle)
 screen-writer toggle | activate | deactivate
 screen-writer clear | undo | redo | visibility | quit
-screen-writer tool <pen|highlighter|line|arrow|rectangle|ellipse|text|marker|eraser|laser|spotlight>
+screen-writer tool <select|pen|highlighter|line|arrow|rectangle|ellipse|text|marker|eraser|laser|spotlight|snapshot>
 screen-writer color <red|orange|yellow|green|blue|purple|white|black|1-8|#rrggbb>
 screen-writer size <1-40>
 screen-writer demo             draw one sample of each annotation type
@@ -150,6 +155,9 @@ On Wayland, screen-writer runs through XWayland. GNOME doesn't support the
   app you were using. If you switch apps mid-drawing, clicking the overlay brings
   keyboard focus back.
 - **No pressure sensitivity:** tablet pressure isn't used yet.
+- **Snapshots:** the screenshot portal saves a full-screen PNG (usually in
+  `~/Pictures`). screen-writer crops it and deletes the file right away. The
+  first capture may show a permission prompt.
 - **HiDPI:** with fractional scaling, XWayland windows may look blurry.
 
 ## Project layout
@@ -164,4 +172,5 @@ src/font.rs      font lookup and text-to-path conversion
 src/geom.rs      geometry and damage tracking
 src/ipc.rs       control socket
 src/gnome.rs     GNOME shortcut installer
+src/snap.rs      screen capture through the screenshot portal
 ```

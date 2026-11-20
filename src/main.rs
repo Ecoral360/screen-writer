@@ -6,6 +6,7 @@ mod geom;
 mod gnome;
 mod ipc;
 mod shapes;
+mod snap;
 mod toolbar;
 mod xwin;
 
@@ -27,7 +28,7 @@ COMMANDS (also accepted as --toggle, --clear, ... like gromit-mpx):
     visibility    hide/show the drawings                              [Ctrl+F9]
     quit          exit                                                [Alt+F9]
     activate | deactivate | undo | redo
-    tool <pen|highlighter|line|arrow|rectangle|ellipse|text|marker|eraser|laser|spotlight>
+    tool <select|pen|highlighter|line|arrow|rectangle|ellipse|text|marker|eraser|laser|spotlight|snapshot>
     color <red|orange|yellow|green|blue|purple|white|black|1-8|#rrggbb>
     size <1-40>
     demo          draw one sample of each annotation type
@@ -36,12 +37,17 @@ WHILE DRAWING:
     Left drag     draw with current tool       Right drag   erase objects
     Scroll        size (Shift: x4)             Ctrl+Scroll  cycle colors
     Shift         snap lines to 15°, squares/circles
-    P H L A R O T N E K S   pen, highlighter, line, arrow, rect, ellipse,
-                            text, numbered marker, eraser, laser, spotlight
+    V P H L A R O T N E K S G
+                            select/move, pen, highlighter, line, arrow, rect,
+                            ellipse, text, numbered marker, eraser, laser,
+                            spotlight, snapshot
     1-8 colors   F fill   [ ] size   W/B white/blackboard   C clear
-    Ctrl+Z undo   Ctrl+Y redo   Space/Tab hide toolbar   Esc stop drawing
+    Ctrl+Z undo   Ctrl+Y redo   Esc stop drawing
+    Space  hide toolbar      Tab  hide toolbar and cursor preview (clean screen)
     Text tool: click, type, Enter = newline, Esc/Ctrl+Enter = finish
     Marker tool: Ctrl+R restarts numbering at 1
+    Snapshot tool: drag a region, move, click to pin (Esc/right-click discards it);
+                   drag a pinned snapshot to move it
 ";
 
 fn main() {
@@ -105,6 +111,7 @@ fn run_daemon(initial: Option<Cmd>) {
 
     // X event reader thread.
     let conn = x.conn.clone();
+    let app_tx = tx.clone();
     std::thread::spawn(move || {
         while let Ok(e) = conn.wait_for_event() {
             if tx.send(Msg::X(e)).is_err() {
@@ -114,7 +121,7 @@ fn run_daemon(initial: Option<Cmd>) {
         let _ = tx.send(Msg::XClosed);
     });
 
-    let mut app = App::new(x);
+    let mut app = App::new(x, app_tx);
     if let Some(c) = initial {
         app.command(c);
     }

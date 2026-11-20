@@ -18,10 +18,13 @@ pub enum Tool {
     Eraser,
     Laser,
     Spotlight,
+    Snap,
+    Select,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 11] = [
+    pub const ALL: [Tool; 13] = [
+        Tool::Select,
         Tool::Pen,
         Tool::Highlighter,
         Tool::Line,
@@ -33,6 +36,7 @@ impl Tool {
         Tool::Eraser,
         Tool::Laser,
         Tool::Spotlight,
+        Tool::Snap,
     ];
 
     pub fn name(self) -> &'static str {
@@ -48,6 +52,8 @@ impl Tool {
             Tool::Eraser => "Eraser",
             Tool::Laser => "Laser pointer",
             Tool::Spotlight => "Spotlight",
+            Tool::Snap => "Snapshot",
+            Tool::Select => "Select and move",
         }
     }
 
@@ -64,6 +70,8 @@ impl Tool {
             Tool::Eraser => 'E',
             Tool::Laser => 'K',
             Tool::Spotlight => 'S',
+            Tool::Snap => 'G',
+            Tool::Select => 'V',
         }
     }
 
@@ -78,6 +86,8 @@ impl Tool {
             "circle" => Some(Tool::Ellipse),
             "laser" => Some(Tool::Laser),
             "marker" | "number" => Some(Tool::Marker),
+            "snap" | "screenshot" | "pin" => Some(Tool::Snap),
+            "move" => Some(Tool::Select),
             _ => None,
         })
     }
@@ -114,7 +124,9 @@ pub enum Btn {
 impl Btn {
     pub fn tooltip(self) -> String {
         match self {
-            Btn::Grip => "Drag to move toolbar  (Space or Tab hides it)".into(),
+            Btn::Grip => "Drag to move toolbar  (Space hides it, Tab also hides the cursor preview)".into(),
+            Btn::Tool(Tool::Select) => "Select and move  (V): drag anything you placed".into(),
+            Btn::Tool(Tool::Snap) => "Snapshot  (G): drag a region, then click to pin it".into(),
             Btn::Tool(Tool::Marker) => format!("{}  (N, Ctrl+R restarts at 1)", Tool::Marker.name()),
             Btn::Tool(t) => format!("{}  ({})", t.name(), t.key()),
             Btn::Fill => "Fill shapes  (F)".into(),
@@ -453,6 +465,36 @@ fn draw_icon(pm: &mut PixmapMut, tf: Transform, b: Btn, r: IRect, fg: Rgba, v: &
                 pb.move_to(9.0, 20.0);
                 pb.line_to(21.0, 20.0);
                 stroke(pm, pb, 1.8, fg);
+            }
+            Tool::Select => {
+                // Mouse pointer.
+                let pointer = || {
+                    let mut pb = PathBuilder::new();
+                    pb.move_to(6.0, 3.0);
+                    pb.line_to(6.0, 19.0);
+                    pb.line_to(10.0, 15.0);
+                    pb.line_to(13.0, 21.0);
+                    pb.line_to(15.5, 20.0);
+                    pb.line_to(12.5, 14.0);
+                    pb.line_to(18.0, 14.0);
+                    pb.close();
+                    pb
+                };
+                fill(pm, pointer(), fg.with_alpha(60));
+                stroke(pm, pointer(), 1.6, fg);
+            }
+            Tool::Snap => {
+                // Crop corners around a small picture.
+                let mut pb = PathBuilder::new();
+                for (x, y, dx, dy) in [(3.0, 3.0, 1.0, 1.0), (21.0, 3.0, -1.0, 1.0), (3.0, 21.0, 1.0, -1.0), (21.0, 21.0, -1.0, -1.0)] {
+                    pb.move_to(x, y + dy * 6.0);
+                    pb.line_to(x, y);
+                    pb.line_to(x + dx * 6.0, y);
+                }
+                stroke(pm, pb, 2.0, fg);
+                let mut pb = PathBuilder::new();
+                pb.push_rect(Rect::from_xywh(7.5, 8.5, 9.0, 7.0).unwrap());
+                fill(pm, pb, accent);
             }
             Tool::Laser => {
                 let mut pb = PathBuilder::new();

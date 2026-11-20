@@ -2,8 +2,10 @@
 
 use crate::font::Font;
 use crate::geom::{IRect, Pt, seg_dist};
+use std::rc::Rc;
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, PixmapMut, Rect, Stroke, Transform,
+    Color, FillRule, FilterQuality, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Rect,
+    Stroke, Transform,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +47,8 @@ pub enum Kind {
     Text { path: Option<Path>, bounds: IRect },
     /// Numbered circular marker.
     Marker { c: Pt, r: f32, label: Option<Path> },
+    /// Pinned screenshot, shown at `pos` with size `w`x`h` (screen pixels).
+    Image { img: Rc<Pixmap>, pos: Pt, w: f32, h: f32 },
 }
 
 #[derive(Clone)]
@@ -135,6 +139,28 @@ impl Shape {
         Shape { kind: Kind::Text { path: tp.path, bounds }, color, width: px }
     }
 
+    /// Move the shape by `(dx, dy)` pixels.
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        let mv = |p: &mut Pt| *p = Pt::new(p.x + dx, p.y + dy);
+        let mv_path = |p: &mut Option<Path>| *p = p.take().and_then(|p| p.transform(Transform::from_translate(dx, dy)));
+        match &mut self.kind {
+            Kind::Free { points, .. } => points.iter_mut().for_each(mv),
+            Kind::Line { a, b, .. } | Kind::Rect { a, b, .. } | Kind::Ellipse { a, b, .. } => {
+                mv(a);
+                mv(b);
+            }
+            Kind::Text { path, bounds } => {
+                mv_path(path);
+                *bounds = bounds.translate(dx.round() as i32, dy.round() as i32);
+            }
+            Kind::Marker { c, label, .. } => {
+                mv(c);
+                mv_path(label);
+            }
+            Kind::Image { pos, .. } => mv(pos),
+        }
+    }
+
     pub fn draw(&self, pm: &mut PixmapMut, tf: Transform) {
         let w = self.width;
         match &self.kind {
@@ -197,6 +223,27 @@ impl Shape {
                     pm.fill_path(p, &paint(self.color), FillRule::Winding, tf, None);
                 }
             }
+            Kind::Image { img, pos, w, h } => {
+                let r = Rect::from_xywh(pos.x, pos.y, *w, *h);
+                let shadow = Rect::from_xywh(pos.x + 3.0, pos.y + 5.0, *w, *h).map(PathBuilder::from_rect);
+                if let Some(s) = shadow {
+                    pm.fill_path(&s, &paint(Rgba(0, 0, 0, 70)), FillRule::Winding, tf, None);
+                }
+                let (sx, sy) = (*w / img.width() as f32, *h / img.height() as f32);
+                let quality = if (sx - 1.0).abs() < 0.01 && (sy - 1.0).abs() < 0.01 {
+                    FilterQuality::Nearest
+                } else {
+                    FilterQuality::Bilinear
+                };
+                let pp = PixmapPaint { quality, ..Default::default() };
+                pm.draw_pixmap(0, 0, img.as_ref().as_ref(), &pp, tf.pre_translate(pos.x, pos.y).pre_scale(sx, sy), None);
+                if let Some(r) = r {
+                    let border = PathBuilder::from_rect(r);
+                    let mut s = round_stroke(self.width.clamp(2.0, 6.0));
+                    s.line_join = LineJoin::Miter;
+                    pm.stroke_path(&border, &paint(self.color), &s, tf, None);
+                }
+            }
             Kind::Marker { c, r, label } => {
                 if let Some(circle) = PathBuilder::from_circle(c.x, c.y, *r) {
                     pm.fill_path(&circle, &paint(self.color), FillRule::Winding, tf, None);
@@ -224,6 +271,10 @@ impl Shape {
             Kind::Rect { a, b, .. } | Kind::Ellipse { a, b, .. } => IRect::from_f(a.x, a.y, b.x, b.y, w + 2.0),
             Kind::Text { bounds, .. } => IRect::new(bounds.x0 - 4, bounds.y0 - 4, bounds.x1 + 4, bounds.y1 + 4),
             Kind::Marker { c, r, .. } => IRect::around(*c, r + 3.0),
+            Kind::Image { pos, w: iw, h: ih, .. } => {
+                let pad = w.clamp(2.0, 6.0) / 2.0 + 2.0;
+                IRect::from_f(pos.x - pad, pos.y - pad, pos.x + iw + 5.0 + pad, pos.y + ih + 7.0 + pad, 0.0)
+            }
         }
     }
 
@@ -272,6 +323,9 @@ impl Shape {
                 b.contains(p.x, p.y)
             }
             Kind::Marker { c, r: mr, .. } => p.dist(*c) <= mr + r,
+            Kind::Image { pos, w, h, .. } => {
+                p.x >= pos.x - r && p.x <= pos.x + w + r && p.y >= pos.y - r && p.y <= pos.y + h + r
+            }
         }
     }
 }

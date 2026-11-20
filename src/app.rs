@@ -3,12 +3,13 @@
 use crate::font::Font;
 use crate::geom::{Damage, IRect, Pt};
 use crate::shapes::{self, Kind, Rgba, Shape, paint, round_stroke};
+use crate::snap;
 use crate::toolbar::{Btn, PALETTE, Tool, Toolbar, View};
 use crate::xwin::{XWin, keysym, keysym_char};
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
-use tiny_skia::{FillRule, PathBuilder, Pixmap, PixmapMut, Rect, Transform};
+use tiny_skia::{FillRule, PathBuilder, Pixmap, PixmapMut, Rect, StrokeDash, Transform};
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::KeyButMask;
 
@@ -73,10 +74,14 @@ pub enum Msg {
     X(Event),
     Cmd(Cmd),
     XClosed,
+    /// Result of a snapshot capture of `rect`.
+    Snap { rect: IRect, shot: Result<Pixmap, String> },
 }
 
 const MIN_SIZE: f32 = 1.0;
 const MAX_SIZE: f32 = 40.0;
+/// How close (in pixels) a click must be to a shape for the select tool to grab it.
+const SELECT_RADIUS: f32 = 6.0;
 const LASER_LIFE: Duration = Duration::from_millis(650);
 const BOARD_COLORS: [Rgba; 3] = [Rgba(0, 0, 0, 0), Rgba(250, 250, 248, 255), Rgba(30, 45, 38, 255)];
 
@@ -86,6 +91,14 @@ enum Drag {
     Erase { erased: bool },
     Laser,
     Toolbar { dx: i32, dy: i32 },
+    /// Selecting the snapshot region (from `start` to the cursor).
+    Region { end: Pt },
+    /// Waiting for the screenshot of `rect`; the toolbar and cursor are hidden meanwhile.
+    Capturing { rect: IRect },
+    /// Moving the shape in `current`, last seen under the cursor at `last`.
+    /// `fresh`: a new snapshot that follows the cursor until a click pins it;
+    /// otherwise an existing shape being dragged.
+    Carry { last: Pt, fresh: bool },
 }
 
 struct TextEdit {
@@ -97,6 +110,7 @@ struct TextEdit {
 
 pub struct App {
     x: XWin,
+    tx: Sender<Msg>,
     font: Option<Font>,
     base: Pixmap,
     shapes: Vec<Rc<Shape>>,
@@ -121,6 +135,9 @@ pub struct App {
     laser: Vec<(Pt, Instant)>,
     text: Option<TextEdit>,
     marker_n: u32,
+    /// Tab mode: besides the toolbar, hide cursor previews (marker ghost, size
+    /// ring, select outline...) so they don't show up in screenshots or shares.
+    no_preview: bool,
 
     damage: Damage,
     last_transient: Vec<IRect>,
@@ -130,13 +147,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(x: XWin) -> App {
+    pub fn new(x: XWin, tx: Sender<Msg>) -> App {
         let base = Pixmap::new(x.width as u32, x.height as u32).expect("screen has zero size");
         let mut toolbar = Toolbar::new();
         toolbar.place(x.primary_monitor());
         let monitors = x.monitors();
         let mut app = App {
             x,
+            tx,
             font: Font::load(),
             base,
             shapes: Vec::new(),
@@ -159,6 +177,7 @@ impl App {
             laser: Vec::new(),
             text: None,
             marker_n: 1,
+            no_preview: false,
             damage: Damage::default(),
             last_transient: Vec::new(),
             last_spot: false,
@@ -217,6 +236,7 @@ impl App {
             Msg::XClosed => self.quit = true,
             Msg::Cmd(c) => self.command(c),
             Msg::X(e) => self.x_event(e),
+            Msg::Snap { rect, shot } => self.snap_done(rect, shot),
         }
     }
 
@@ -312,6 +332,101 @@ impl App {
     }
 
     fn cancel_drag(&mut self) {
+        match self.drag {
+            // A carried snapshot is pinned where it is rather than lost.
+            Drag::Carry { .. } => return self.drop_carry(),
+            Drag::Capturing { .. } => self.damage_toolbar(),
+            _ => {}
+        }
+        if let Some(s) = self.current.take() {
+            self.damage.add(s.bounds());
+        }
+        self.drag = Drag::None;
+    }
+
+    // ---------------------------------------------------------------- snapshots
+
+    /// Region selected for a snapshot, clipped to the screen.
+    fn selection(&self) -> Option<IRect> {
+        let Drag::Region { end } = self.drag else { return None };
+        let a = self.start;
+        let r = IRect::new(a.x.min(end.x) as i32, a.y.min(end.y) as i32, a.x.max(end.x) as i32, a.y.max(end.y) as i32);
+        Some(r.intersect(&self.screen()))
+    }
+
+    fn finish_select(&mut self) {
+        let Some(rect) = self.selection() else { return };
+        self.drag = Drag::None;
+        if rect.w() < 8 || rect.h() < 8 {
+            return;
+        }
+        // Hide the selection, cursor and toolbar, give the compositor a moment
+        // to show that frame, then capture.
+        self.drag = Drag::Capturing { rect };
+        self.damage_toolbar();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = tx.send(Msg::Snap { rect, shot: snap::capture() });
+        });
+    }
+
+    fn snap_done(&mut self, rect: IRect, shot: Result<Pixmap, String>) {
+        // Ignore results that were cancelled meanwhile.
+        if !matches!(self.drag, Drag::Capturing { rect: r } if r == rect) {
+            return;
+        }
+        self.drag = Drag::None;
+        self.damage_toolbar();
+        let shot = match shot {
+            Ok(s) => s,
+            Err(e) => return eprintln!("screen-writer: snapshot failed: {e}"),
+        };
+        let scale = shot.width() as f32 / self.x.width as f32;
+        let Some(img) = snap::crop(&shot, rect.x0, rect.y0, rect.w(), rect.h(), scale) else { return };
+        let pos = Pt::new(rect.x0 as f32, rect.y0 as f32);
+        let kind = Kind::Image { img: Rc::new(img), pos, w: rect.w() as f32, h: rect.h() as f32 };
+        let c = self.cursor.unwrap_or(Pt::new(rect.x1 as f32, rect.y1 as f32));
+        self.current = Some(Shape { kind, color: self.color, width: self.size });
+        self.drag = Drag::Carry { last: c, fresh: true };
+    }
+
+    /// Topmost pinned snapshot under `p`.
+    fn image_at(&self, p: Pt) -> Option<usize> {
+        self.shapes.iter().rposition(|s| matches!(s.kind, Kind::Image { .. }) && s.hit(p, 0.0))
+    }
+
+    /// Topmost shape of any kind under `p` (for the select tool).
+    fn shape_at(&self, p: Pt) -> Option<usize> {
+        self.shapes.iter().rposition(|s| s.hit(p, SELECT_RADIUS))
+    }
+
+    fn pick_up(&mut self, i: usize, p: Pt) {
+        self.checkpoint();
+        let s = (*self.shapes[i]).clone();
+        let mut rest = self.shapes.clone();
+        rest.remove(i);
+        self.set_shapes(rest);
+        self.drag = Drag::Carry { last: p, fresh: false };
+        self.current = Some(s);
+    }
+
+    /// Pin the carried snapshot where it is.
+    fn drop_carry(&mut self) {
+        let Drag::Carry { fresh, .. } = self.drag else { return };
+        self.drag = Drag::None;
+        let Some(s) = self.current.take() else { return };
+        if fresh {
+            self.commit(s);
+        } else {
+            // The checkpoint was taken when it was picked up.
+            s.draw(&mut self.base.as_mut(), Transform::identity());
+            self.damage.add(s.bounds());
+            self.shapes.push(Rc::new(s));
+        }
+    }
+
+    fn discard_carry(&mut self) {
         if let Some(s) = self.current.take() {
             self.damage.add(s.bounds());
         }
@@ -321,6 +436,9 @@ impl App {
     fn set_tool(&mut self, t: Tool) {
         if t != Tool::Text {
             self.commit_text();
+        }
+        if matches!(self.drag, Drag::Region { .. } | Drag::Carry { .. }) {
+            self.cancel_drag();
         }
         self.tool = t;
         self.damage_toolbar();
@@ -544,9 +662,21 @@ impl App {
             return;
         }
         match sym {
-            keysym::ESCAPE => return self.deactivate(),
-            keysym::SPACE | keysym::TAB | keysym::ISO_LEFT_TAB => {
+            keysym::ESCAPE => {
+                return match self.drag {
+                    Drag::Carry { fresh: true, .. } => self.discard_carry(),
+                    Drag::Region { .. } | Drag::Capturing { .. } => self.cancel_drag(),
+                    _ => self.deactivate(),
+                };
+            }
+            keysym::SPACE => {
                 self.toolbar.visible = !self.toolbar.visible;
+                self.hover = None;
+                return self.damage_toolbar();
+            }
+            keysym::TAB | keysym::ISO_LEFT_TAB => {
+                self.no_preview = !self.no_preview;
+                self.toolbar.visible = !self.no_preview;
                 self.hover = None;
                 return self.damage_toolbar();
             }
@@ -601,6 +731,14 @@ impl App {
             }
             6 | 7 => return,
             _ => {}
+        }
+        if let Drag::Carry { fresh: true, .. } = self.drag {
+            match button {
+                1 => self.drop_carry(),
+                3 => self.discard_carry(),
+                _ => {}
+            }
+            return;
         }
         if !matches!(self.drag, Drag::None) {
             return;
@@ -665,6 +803,15 @@ impl App {
                 self.laser.push((p, Instant::now()));
             }
             Tool::Spotlight => {}
+            Tool::Select => {
+                if let Some(i) = self.shape_at(p) {
+                    self.pick_up(i, p);
+                }
+            }
+            Tool::Snap => match self.image_at(p) {
+                Some(i) => self.pick_up(i, p),
+                None => self.drag = Drag::Region { end: p },
+            },
         }
     }
 
@@ -713,6 +860,17 @@ impl App {
             }
             Drag::Erase { .. } => self.erase_at(p),
             Drag::Laser => self.laser.push((p, Instant::now())),
+            Drag::Region { .. } => self.drag = Drag::Region { end: p },
+            Drag::Capturing { .. } => {}
+            Drag::Carry { last, fresh } => {
+                let (dx, dy) = ((p.x - last.x).round(), (p.y - last.y).round());
+                if let Some(s) = &mut self.current
+                    && (dx != 0.0 || dy != 0.0)
+                {
+                    s.translate(dx, dy);
+                    self.drag = Drag::Carry { last: Pt::new(last.x + dx, last.y + dy), fresh };
+                }
+            }
             Drag::Draw => {
                 let start = self.start;
                 let Some(cur) = &mut self.current else { return };
@@ -756,6 +914,8 @@ impl App {
                     }
                 }
             }
+            (Drag::Region { .. }, 1) => self.finish_select(),
+            (Drag::Carry { fresh: false, .. }, 1) => self.drop_carry(),
             (Drag::Erase { .. }, 1 | 3) | (Drag::Laser, 1) | (Drag::Toolbar { .. }, 1) => self.drag = Drag::None,
             _ => {}
         }
@@ -811,6 +971,25 @@ impl App {
         70.0 + self.size * 10.0
     }
 
+    /// Box to outline for the select tool: the shape being moved, or the one under the cursor.
+    fn select_highlight(&self) -> Option<IRect> {
+        if self.tool != Tool::Select || !self.active || self.no_preview {
+            return None;
+        }
+        if let Drag::Carry { .. } = self.drag {
+            return self.current.as_ref().map(|s| s.bounds());
+        }
+        if !matches!(self.drag, Drag::None) || self.cursor_over_toolbar() {
+            return None;
+        }
+        let c = self.cursor?;
+        self.shape_at(c).map(|i| self.shapes[i].bounds())
+    }
+
+    fn capturing(&self) -> bool {
+        matches!(self.drag, Drag::Capturing { .. })
+    }
+
     fn cursor_over_toolbar(&self) -> bool {
         self.cursor.is_some_and(|c| self.on_toolbar(c).is_some())
     }
@@ -818,16 +997,23 @@ impl App {
     /// Rectangles of overlays that move and must be repainted where they were and are.
     fn transient_rects(&self) -> Vec<IRect> {
         let mut v = Vec::new();
+        // Freehand strokes being drawn damage only their newest segments; moved ones need their whole box.
         if let Some(s) = &self.current
-            && !matches!(s.kind, Kind::Free { .. })
+            && (!matches!(s.kind, Kind::Free { .. }) || matches!(self.drag, Drag::Carry { .. }))
         {
             v.push(s.bounds());
         }
         if let Some(te) = &self.text {
             v.push(self.text_box(te));
         }
-        if !self.active {
+        if let Some(r) = self.selection() {
+            v.push(IRect::new(r.x0 - 3, r.y0 - 3, r.x1 + 4, r.y1 + 4));
+        }
+        if !self.active || self.capturing() {
             return v;
+        }
+        if let Some(b) = self.select_highlight() {
+            v.push(IRect::new(b.x0 - 3, b.y0 - 3, b.x1 + 4, b.y1 + 4));
         }
         if !self.laser.is_empty() {
             let pts: Vec<Pt> = self.laser.iter().map(|(p, _)| *p).collect();
@@ -840,6 +1026,7 @@ impl App {
                 Tool::Marker => shapes::marker_radius(self.size) + 4.0,
                 Tool::Highlighter => shapes::highlighter_width(self.size) / 2.0 + 4.0,
                 Tool::Laser => 14.0,
+                Tool::Snap => 14.0,
                 _ => self.size / 2.0 + 6.0,
             };
             v.push(IRect::around(c, r));
@@ -895,7 +1082,13 @@ impl App {
                     m.stroke_path(&p, &paint(te.color), &round_stroke(2.0), tf, None);
                 }
             }
-            if self.active {
+            if let Some(sel) = self.selection() {
+                draw_selection(&mut m, tf, sel);
+            }
+            if self.active && !self.capturing() {
+                if let Some(b) = self.select_highlight() {
+                    draw_outline(&mut m, tf, b);
+                }
                 self.draw_laser(&mut m, tf);
                 if self.last_spot
                     && let Some(c) = self.cursor
@@ -907,7 +1100,8 @@ impl App {
                         m.fill_path(&p, &paint(Rgba(0, 0, 0, 165)), FillRule::EvenOdd, tf, None);
                     }
                 }
-                if !self.cursor_over_toolbar() {
+                // The laser dot is the pointer itself, so it stays in Tab mode.
+                if !self.cursor_over_toolbar() && (!self.no_preview || self.tool == Tool::Laser) {
                     self.draw_cursor(&mut m, tf);
                 }
                 if self.toolbar.visible {
@@ -983,7 +1177,18 @@ impl App {
                 dot(m, 2.0, Rgba(255, 230, 220, 255));
             }
             Tool::Spotlight => ring(m, self.spot_radius(), Rgba(255, 255, 255, 120)),
-            Tool::Text => {}
+            Tool::Snap => {
+                let mut pb = PathBuilder::new();
+                pb.move_to(c.x - 10.0, c.y);
+                pb.line_to(c.x + 10.0, c.y);
+                pb.move_to(c.x, c.y - 10.0);
+                pb.line_to(c.x, c.y + 10.0);
+                if let Some(p) = pb.finish() {
+                    m.stroke_path(&p, &paint(Rgba(0, 0, 0, 160)), &round_stroke(3.0), tf, None);
+                    m.stroke_path(&p, &paint(Rgba(255, 255, 255, 230)), &round_stroke(1.5), tf, None);
+                }
+            }
+            Tool::Text | Tool::Select => {}
             _ => {
                 if self.size > 3.0 {
                     ring(m, self.size / 2.0, self.color);
@@ -993,6 +1198,33 @@ impl App {
             }
         }
     }
+}
+
+/// Dashed outline of the snapshot region.
+fn draw_selection(m: &mut PixmapMut, tf: Transform, r: IRect) {
+    let Some(rect) = Rect::from_xywh(r.x0 as f32 + 0.5, r.y0 as f32 + 0.5, r.w().max(1) as f32, r.h().max(1) as f32) else {
+        return;
+    };
+    let path = PathBuilder::from_rect(rect);
+    m.fill_path(&path, &paint(Rgba(255, 255, 255, 30)), FillRule::Winding, tf, None);
+    m.stroke_path(&path, &paint(Rgba(0, 0, 0, 200)), &round_stroke(3.0), tf, None);
+    let mut s = round_stroke(1.5);
+    s.line_cap = tiny_skia::LineCap::Butt;
+    s.dash = StrokeDash::new(vec![6.0, 4.0], 0.0);
+    m.stroke_path(&path, &paint(Rgba(255, 255, 255, 255)), &s, tf, None);
+}
+
+/// Dashed box around the shape the select tool is pointing at.
+fn draw_outline(m: &mut PixmapMut, tf: Transform, r: IRect) {
+    let Some(rect) = Rect::from_xywh(r.x0 as f32 + 0.5, r.y0 as f32 + 0.5, r.w().max(1) as f32, r.h().max(1) as f32) else {
+        return;
+    };
+    let path = PathBuilder::from_rect(rect);
+    m.stroke_path(&path, &paint(Rgba(0, 0, 0, 150)), &round_stroke(2.5), tf, None);
+    let mut s = round_stroke(1.2);
+    s.line_cap = tiny_skia::LineCap::Butt;
+    s.dash = StrokeDash::new(vec![5.0, 4.0], 0.0);
+    m.stroke_path(&path, &paint(Rgba(120, 190, 255, 255)), &s, tf, None);
 }
 
 fn text_px(size: f32) -> f32 {
